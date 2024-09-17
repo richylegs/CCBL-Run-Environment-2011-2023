@@ -1,0 +1,306 @@
+---
+title: "Cape Cod Run Expectancy & Steal Model 2011-2022"
+author: "Richard Legler"
+date: "June 6, 2024"
+output: 
+  rmdformats::readthedown:
+    number_sections: true
+    highlight: tango
+    df_print: paged
+    center: true
+---
+
+```{r setup, include=FALSE}
+# Set working directory
+knitr::opts_knit$set(root.dir = 'C:/Users/richa/OneDrive/Documents/Hyannis Harbor Hawks/Cape Code Data')
+
+# Clear environment
+rm(list=ls())
+
+# Import libraries
+library(dplyr)
+library(tidyr)
+library(openxlsx)
+```
+
+# Import Data
+
+```{r}
+# Import
+df_2011_2022 <- read.csv("CCBL full_pbp 2011-2022.csv")
+df_2023 <- read.csv("CCBL full_pbp 2023.csv")
+
+# Keep Necessary Columns
+df_2011_2022 <- df_2011_2022[,c("Date", "GameID","Inning", "Top_Btm", "Balls", "Strikes", "Outs", "Runner1B", "Runner2B", "Runner3B","InningPACount", "PitchNumPA", "TeamRuns", "RunsScoredOnPlay")]
+df_2023 <- df_2023[,c("GameID","Inning", "Top_Btm", "Balls", "Strikes", "Outs", "Runner1B", "Runner2B", "Runner3B","InningPACount", "PitchNumPA", "TeamRuns", "RunsScoredOnPlay")]
+```
+
+# Transform Data
+## Transform Date to Year
+
+```{r}
+# Transform Date to Year
+df_2011_2022 <- df_2011_2022 %>%
+  mutate(Year = format(as.Date(Date, format = "%m/%d/%Y"), "%Y")) %>%
+  select(-Date) %>%
+  rename(Date = Year)
+
+# Add Year Column to 2023 Data
+df_2023[,c("Date")] <- "2023"
+```
+
+## Remove Rows that add a Pinch Runner
+
+Only occurs in 2023 PBP Data
+
+```{r}
+selected_row <- c()
+
+for (i in 1:(nrow(df_2023))) {
+  if (is.na(df_2023$Outs[i])){
+    selected_row <- c(selected_row, i)
+  }
+}
+
+df_2023 <- df_2023[-selected_row,]
+```
+
+## Merge Data for 2021 through 2023
+
+```{r}
+# Merge data frames
+df <- rbind(df_2011_2022, df_2023)
+
+# Transform Year to integer
+df$Date <- as.integer(df$Date)
+
+# Keep data from 2021 through 2023
+df <- df %>%
+  filter(Date >= 2021)
+```
+
+
+## Add Column with Score After the Pitch
+
+```{r}
+# Add column
+df[,c("TeamRunsAfter")] <- df$TeamRuns + df$RunsScoredOnPlay
+```
+
+## Convert Runners on Base Data
+```{r}
+# First Base
+df$Runner1B <- ifelse(is.na(df$Runner1B),0,1)
+
+# Second Base
+df$Runner2B <- ifelse(is.na(df$Runner2B),0,1)
+
+# Third Base
+df$Runner3B <- ifelse(is.na(df$Runner3B),0,1)
+```
+
+## Make Sure 3 outs in Inning
+
+```{r}
+df <- df %>%
+  arrange(Date, GameID, Top_Btm, Inning, InningPACount, PitchNumPA) %>%
+  mutate(OutsOnPlay = (lead(Outs) - Outs) %% 3) %>%
+  group_by(GameID, Inning, Top_Btm) %>%
+  mutate(OutsInInning = sum(OutsOnPlay)) %>%
+  filter(OutsInInning == 3) %>%
+  ungroup()
+```
+
+
+# Establish Game States
+Game State format: Balls/Strikes/Outs/Runner on 1B/Runner on 2B/Runner on 3B
+Examples:
+  0-0 count, 0 outs and 0 baserunners -> 000000,
+  2-1 count, 1 out and runner on 2nd -> 211010,
+  1-2 count, 2 outs and bases loaded -> 122111
+
+```{r}
+# Add column for Game States
+df[,c("GameState")] <- paste(df$Balls, df$Strikes, df$Outs, df$Runner1B, df$Runner2B, df$Runner3B, sep = "")
+```
+
+## Remove Duplicated Game States in a Plate Appearance
+
+Occurs when a pitch is fouled off with 2 strikes, since the game state does not change
+
+```{r}
+selected_row <- c()
+
+for (i in 1:(nrow(df) - 1)) {
+  if (!is.na(df$GameState[i]) && !is.na(df$GameState[i + 1]) &&
+      df$GameState[i] == df$GameState[i + 1] &&
+      df$InningPACount[i] == df$InningPACount[i + 1]) {
+    selected_row <- c(selected_row, i)
+  }
+}
+
+df_clean <- df[-selected_row,]
+```
+
+
+# Runs Scored Rest of Inning
+## Add Column for Runs Scored Rest of Inning
+
+```{r}
+df_clean[,c("RunsRestInning")] <- NA
+```
+
+## Seperate Data into Half Innings
+
+```{r}
+split_df <- split(df_clean, f=list(df_clean$GameID, df_clean$Inning, df_clean$Top_Btm, df_clean$Date))
+```
+
+## Function for runs scored in rest of inning
+
+```{r}
+runs_rest_inning <- function(current_score, score_end_inning){
+  return(score_end_inning - current_score)
+}
+```
+
+## Loop to assign runs scored
+
+```{r}
+# Loop through list of data frames
+for (i in seq_along(split_df)) {
+  split_data <- split_df[[i]]
+  
+  # Check if split_df is not empty
+  if (nrow(split_data) > 0) {
+  
+    # Number of rows in subset
+    n_rows <- nrow(split_data)
+    
+    # Score at end inning of the subset
+    score_end_inning <- tail(split_data$TeamRunsAfter, 1)
+    
+    # Loop through each row in subset
+    for (j in 1:n_rows) {
+      # Retrieve current score
+      current_score <- split_data$TeamRuns[j]
+      
+      # Assign runs of rest inning
+      split_data$RunsRestInning[j] <- runs_rest_inning(current_score, score_end_inning)
+    }
+    
+    # Update original dataframe with modified split_df
+    df_clean[df_clean$GameID %in% split_data$GameID & 
+         df_clean$Inning %in% split_data$Inning &
+         df_clean$Top_Btm %in% split_data$Top_Btm, ] <- split_data
+  }
+}
+```
+
+# Run Expectancy
+
+```{r}
+game_state_summary <- df_clean %>%
+  group_by(GameState) %>%
+  summarize(
+    count = n(), # Count of occurences
+    sum_runs_rest_inning = sum(RunsRestInning, na.rm = TRUE), # Sum of runs_rest_inning
+    expected_runs <- sum_runs_rest_inning / count # Expected runs in each game state
+  ) %>%
+  ungroup()
+
+# Rename column
+game_state_summary <- game_state_summary %>%
+  rename(expected_runs = `expected_runs <- sum_runs_rest_inning/count`)
+```
+
+## Split out game states
+For readability
+
+```{r}
+game_state_summary <- game_state_summary %>%
+  mutate(balls = substr(GameState, 1, 1),
+         strikes = substr(GameState, 2, 2),
+         outs = substr(GameState, 3, 3),
+         first = substr(GameState, 4, 4),
+         second = substr(GameState, 5, 5),
+         third = substr(GameState, 6, 6))
+```
+
+## Run Expectancy Matrices by Count
+
+```{r}
+# List to Store Run Expectancy Matrices
+RE_matrices <- list()
+
+# List of all possible counts
+ball_count <- list(0, 1, 2, 3)
+strike_count <- list(0, 1, 2)
+
+# Convert game_state_summary data types
+game_state_summary$balls <- as.integer(game_state_summary$balls)
+game_state_summary$strikes <- as.integer(game_state_summary$strikes)
+```
+
+
+```{r}
+# Loop Through Counts
+for (i in 1:length(ball_count)) {
+  for (j in 1:length(strike_count)){
+    # Filtered game_state_summary
+    temp <- game_state_summary %>%
+      filter(balls == ball_count[i], strikes == strike_count[j])
+    
+    # Initialize and populate RE_matrix
+    rows <- c("000", "100", "010", "001", "110", "101", "011", "111")
+    columns <- c("0 outs", "1 out", "2 outs")
+    RE_matrix <- matrix(NA, nrow = length(rows), ncol = length(columns), dimnames = list(rows, columns))
+    
+    match_indices_row <- match(substr(temp$GameState, 4, 6), rows)
+    match_indices_col <- match(substr(temp$GameState, 3, 3), substr(columns, 1, 1))
+    RE_matrix[cbind(match_indices_row, match_indices_col)] <- round(temp$expected_runs, 3)
+    
+    # Save matrix to list
+    RE_matrices[[paste0("RE_matrix_", ball_count[i], "-", strike_count[j],"_count")]] <- RE_matrix
+  }
+}
+```
+
+
+# Export
+## Game State Summary
+```{r}
+# Save the game_state_summary to a xlsx file
+write.xlsx(game_state_summary, file = "C:/Users/richa/OneDrive/Documents/Hyannis Harbor Hawks/Run Expectancy & Steal Model/Output/RE_summary_by_count_2021x2023.xlsx", sheetName = "GameStateSummary", rowNames = FALSE, overwrite = TRUE)
+write.xlsx(game_state_summary, file = "C:/Users/richa/OneDrive/Documents/Hyannis Harbor Hawks/Cape Code Data/RE_summary_by_count_2021x2023.xlsx", sheetName = "GameStateSummary", rowNames = FALSE, overwrite = TRUE)
+```
+
+
+## Matrix by Count
+
+```{r}
+# Create a new Excel workbook
+wb <- createWorkbook()
+
+# Loop through each count in RE_matrices
+for (i in 1:length(ball_count)) {
+  for (j in 1:length(strike_count)){
+  
+    # RE_matrix for current count
+    RE_matrix <- RE_matrices[[paste0("RE_matrix_", ball_count[i], "-", strike_count[j],"_count")]]
+    
+    # Create a new sheet with the name "RE YYYY"
+    sheetName <- paste(ball_count[i], strike_count[j], sep = "-")
+    addWorksheet(wb, sheetName)
+    
+    # Add an initial column for the runners situation
+    runners_situation <- c("000", "100", "010", "001", "110", "101", "011", "111")
+    writeData(wb, sheet = sheetName, x = cbind(Runners_Situation = runners_situation, RE_matrix))
+  }
+}
+
+# Save the workbook to a xlsx file
+saveWorkbook(wb, "C:/Users/richa/OneDrive/Documents/Hyannis Harbor Hawks/Run Expectancy & Steal Model/Output/RE_matrices_by_count_2021x2023.xlsx", overwrite = TRUE)
+saveWorkbook(wb, "C:/Users/richa/OneDrive/Documents/Hyannis Harbor Hawks/Cape Code Data/RE_matrices_by_count_2021x2023.xlsx", overwrite = TRUE)
+```
+

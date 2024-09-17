@@ -1,0 +1,473 @@
+---
+title: "Cape Cod Run Expectancy & Steal Model 2011-2022"
+author: "Richard Legler"
+date: "May 13, 2024"
+output: 
+  rmdformats::readthedown:
+    number_sections: true
+    highlight: tango
+    df_print: paged
+    center: true
+---
+
+```{r setup, include=FALSE}
+# Set working directory
+knitr::opts_knit$set(root.dir = 'C:/Users/richa/OneDrive/Documents/Hyannis Harbor Hawks/Cape Code Data')
+
+# Clear environment
+rm(list=ls())
+
+# Import libraries
+library(dplyr)
+library(tidyr)
+library(openxlsx)
+```
+
+# Import Data
+
+```{r}
+# Import
+df <- read.csv("CCBL full_pbp 2011-2022.csv")
+
+# Keep Necessary Columns
+df <- df[,c("Date", "GameID","Inning", "Top_Btm", "Outs", "Runner1B", "Runner2B", "Runner3B","InningPACount", "PitchNumPA", "TeamRuns", "RunsScoredOnPlay")]
+```
+
+# Transform Data
+## Transform Date to Year
+
+```{r}
+df <- df %>%
+  mutate(Year = format(as.Date(Date, format = "%m/%d/%Y"), "%Y")) %>%
+  select(-Date) %>%
+  rename(Date = Year)
+```
+
+## Add Column with Score After the Pitch
+
+```{r}
+# Add column
+df[,c("TeamRunsAfter")] <- df$TeamRuns + df$RunsScoredOnPlay
+```
+
+## Convert Runners on Base Data
+```{r}
+# First Base
+df$Runner1B <- ifelse(is.na(df$Runner1B),0,1)
+
+# Second Base
+df$Runner2B <- ifelse(is.na(df$Runner2B),0,1)
+
+# Third Base
+df$Runner3B <- ifelse(is.na(df$Runner3B),0,1)
+```
+
+## Make Sure 3 outs in Inning
+
+```{r}
+df <- df %>%
+  arrange(Date, GameID, Top_Btm, Inning, InningPACount, PitchNumPA) %>%
+  mutate(OutsOnPlay = (lead(Outs) - Outs) %% 3) %>%
+  group_by(GameID, Inning, Top_Btm) %>%
+  mutate(OutsInInning = sum(OutsOnPlay)) %>%
+  filter(OutsInInning == 3) %>%
+  ungroup()
+```
+
+
+# Establish Game States
+Game State format: Outs/Runner on 1B/Runner on 2B/Runner on 3B
+Examples:
+  0 outs and 0 baserunners -> 0000,
+  1 out and runner on 2nd -> 1010,
+  2 outs and bases loaded -> 2111
+
+```{r}
+# Add column for Game States
+df[,c("GameState")] <- paste(df$Outs, df$Runner1B, df$Runner2B, df$Runner3B, sep = "")
+```
+
+## Remove Duplicated Game States in a Plate Appearance
+
+```{r}
+selected_row <- c()
+
+for (i in 1:(nrow(df) - 1)) {
+  if (!is.na(df$GameState[i]) && !is.na(df$GameState[i + 1]) &&
+      df$GameState[i] == df$GameState[i + 1] &&
+      df$InningPACount[i] == df$InningPACount[i + 1]) {
+    selected_row <- c(selected_row, i)
+  }
+}
+
+df_clean <- df[-selected_row,]
+```
+
+
+# Runs Scored Rest of Inning
+## Add Column for Runs Scored Rest of Inning
+
+```{r}
+df_clean[,c("RunsRestInning")] <- NA
+```
+
+## Seperate Data into Half Innings
+
+```{r}
+split_df <- split(df_clean, f=list(df_clean$GameID, df_clean$Inning, df_clean$Top_Btm, df_clean$Date))
+```
+
+## Function for runs scored in rest of inning
+
+```{r}
+runs_rest_inning <- function(current_score, score_end_inning){
+  return(score_end_inning - current_score)
+}
+```
+
+## Loop to assign runs scored
+
+```{r}
+# Loop through list of data frames
+for (i in seq_along(split_df)) {
+  split_data <- split_df[[i]]
+  
+  # Check if split_df is not empty
+  if (nrow(split_data) > 0) {
+  
+    # Number of rows in subset
+    n_rows <- nrow(split_data)
+    
+    # Score at end inning of the subset
+    score_end_inning <- tail(split_data$TeamRunsAfter, 1)
+    
+    # Loop through each row in subset
+    for (j in 1:n_rows) {
+      # Retrieve current score
+      current_score <- split_data$TeamRuns[j]
+      
+      # Assign runs of rest inning
+      split_data$RunsRestInning[j] <- runs_rest_inning(current_score, score_end_inning)
+    }
+    
+    # Update original dataframe with modified split_df
+    df_clean[df_clean$GameID %in% split_data$GameID & 
+         df_clean$Inning %in% split_data$Inning &
+         df_clean$Top_Btm %in% split_data$Top_Btm, ] <- split_data
+  }
+}
+```
+
+# Seperate Data into Respective Years
+
+```{r}
+for (year in 2011:2022) {
+  # Filter dataframe for the current year
+  filtered_df <- df_clean %>%
+    filter(Date == as.character(year))
+  
+  # Assign the filtered dataframe to a new dataframe with year in name
+  assign(paste0("df_", year), filtered_df)
+}
+```
+
+
+# Run Expectancy
+
+
+```{r}
+# List to Store Run Expectancy Matrices
+RE_matrices <- list()
+
+# Loop Through Years
+for (year in 2011:2022) {
+  # Get dataframe for the current year
+  df_year <- get(paste0("df_", year))
+  
+  # Check if dataframe is empty
+  if (nrow(df_year) > 0) {
+    # Perform RE_matrix calculations
+    game_state_summary <- df_year %>%
+      group_by(GameState) %>%
+      summarize(
+        count = n(),
+        sum_runs_rest_inning = sum(RunsRestInning, na.rm = TRUE),
+        expected_runs = sum_runs_rest_inning / count
+      ) %>%
+      ungroup()
+    
+    # Initialize and populate RE_matrix
+    rows <- c("000", "100", "010", "001", "110", "101", "011", "111")
+    columns <- c("0 outs", "1 out", "2 outs")
+    RE_matrix <- matrix(NA, nrow = length(rows), ncol = length(columns), dimnames = list(rows, columns))
+    
+    match_indices_row <- match(substr(game_state_summary$GameState, 2, 4), rows)
+    match_indices_col <- match(substr(game_state_summary$GameState, 1, 1), substr(columns, 1, 1))
+    RE_matrix[cbind(match_indices_row, match_indices_col)] <- round(game_state_summary$expected_runs, 3)
+    
+    # Save RE_matrix to list with appropriate name
+    RE_matrices[[paste0("RE_matrix_", year)]] <- RE_matrix
+  }
+}
+
+print(RE_matrices)
+```
+
+
+# Steal Breakeven %
+## Functions
+
+```{r}
+# Expected Runs Starting Game State
+exp_run_start <- function(outs, runners, RE_matrix){
+  # Row
+  if(runners == "000"){
+    row_index <- 1
+  }
+  else if(runners == "100"){
+    row_index <- 2
+  }
+  else if(runners == "010"){
+    row_index <- 3
+  }
+  else if(runners == "001"){
+    row_index <- 4
+  }
+  else if(runners == "110"){
+    row_index <- 5
+  }
+  else if(runners == "101"){
+    row_index <- 6
+  }
+  else if(runners == "011"){
+    row_index <- 7
+  }
+  else if(runners == "111"){
+    row_index <- 8
+  }
+  
+  # Columns
+  col_index <- outs + 1
+    
+  # Corresponding expected runs
+  result <- RE_matrix[row_index, col_index]
+  return(as.numeric(result[1]))
+}
+```
+
+
+```{r}
+# Expected Runs Successful Game State
+exp_run_success <- function(outs, runners, sb, RE_matrix){
+  # Row
+  if(runners == "000"){
+    row_index <- 1
+  }
+  else if(runners == "100"){
+    row_index <- 2
+  }
+  else if(runners == "010"){
+    row_index <- 3
+  }
+  else if(runners == "001"){
+    row_index <- 4
+  }
+  else if(runners == "110"){
+    row_index <- 5
+  }
+  else if(runners == "101"){
+    row_index <- 6
+  }
+  else if(runners == "011"){
+    row_index <- 7
+  }
+  else if(runners == "111"){
+    row_index <- 8
+  }
+  
+  # Columns
+  col_index <- outs + 1
+    
+  # Corresponding expected runs
+  result <- RE_matrix[row_index, col_index]
+  
+  # Add a run if Home is stolen
+  if(sb == "H"){
+    return(as.numeric(result[1]+1))
+  }
+  else{
+    return(as.numeric(result[1]))
+  }
+}
+```
+
+
+```{r}
+# Expected Runs Failed Game State
+exp_run_fail <- function(outs, runners, RE_matrix){
+  # Add an out for being caught stealing
+  new_outs <- outs + 1
+  
+  # End inning if 3rd out
+  if(new_outs == 3){
+    return(0)
+  }
+  else{
+  # Row
+  if(runners == "000"){
+    row_index <- 1
+  }
+  else if(runners == "100"){
+    row_index <- 2
+  }
+  else if(runners == "010"){
+    row_index <- 3
+  }
+  else if(runners == "001"){
+    row_index <- 4
+  }
+  else if(runners == "110"){
+    row_index <- 5
+  }
+  else if(runners == "101"){
+    row_index <- 6
+  }
+  else if(runners == "011"){
+    row_index <- 7
+  }
+  else if(runners == "111"){
+    row_index <- 8
+  }
+  
+  # Corresponding expected runs
+  result <- RE_matrix[row_index, new_outs+1]
+  return(as.numeric(result[1]))
+  }
+}
+```
+
+
+```{r}
+# Steal Success Rate (%) to Breakeven
+breakeven_func <- function(start, success, fail){
+  rate <- 1/((success - start)/(start - fail)+1)
+  return(round(rate,3))
+}
+```
+
+# Loop Through Years
+
+```{r}
+# Rows and columns of base data frame
+runners <- rep(c("100", "010", "001", "110", "110", "101", "101", "011", "111"), each = 3)
+outs <- rep(c(0, 1, 2), times = length(runners) / 3)
+er_start <- rep(c(NA), times = length(runners))
+base_to_steal <- rep(c("2", "3", "H","3", "23", "2", "H", "H", "H"), each = 3)
+success <- rep(c("010", "001", "000", "101", "011", "011", "100", "010", "110"), each = 3)
+er_success <- rep(c(NA), times = length(runners))
+fail <- rep(c("000", "000", "000", "100", "010", "001","100","010","110"), each = 3)
+er_fail <- rep(c(NA), times = length(runners))
+breakeven <- rep(c(NA), times = length(runners))
+```
+
+
+```{r}
+for (year in 2011:2022) {
+  # Check if the RE_matrix for the current year exists in RE_matrices
+  re_matrix_name <- paste0("RE_matrix_", year)
+  if (re_matrix_name %in% names(RE_matrices)) {
+    # Create a new data frame for the current year
+    assign(paste0("steal_", year), data.frame(Runners = runners, Outs = outs, ER_Start = er_start, Stolen_Base = base_to_steal, Success = success, ER_Success = er_success, Fail = fail, ER_Fail = er_fail, Breakeven = breakeven))
+    
+    # Update matrix to be used
+    RE_matrix_year <- RE_matrices[[re_matrix_name]]
+    
+    # Get the data frame for the current year
+    steal_year <- get(paste0("steal_", year))
+
+    for (i in 1:nrow(steal_year)) {
+      # Update Expected Runs in Starting Game State
+      steal_year$ER_Start[i] <- exp_run_start(steal_year$Outs[i], steal_year$Runners[i], RE_matrix_year)
+      # Update Expected Runs in Success Game State
+      steal_year$ER_Success[i] <- exp_run_success(steal_year$Outs[i], steal_year$Success[i], steal_year$Stolen_Base[i], RE_matrix_year)
+      # Update Expected Runs in Fail Game State
+      steal_year$ER_Fail[i] <- exp_run_fail(steal_year$Outs[i], steal_year$Fail[i], RE_matrix_year)
+      # Update Breakeven Steal %
+      steal_year$Breakeven[i] <- breakeven_func(steal_year$ER_Start[i], steal_year$ER_Success[i], steal_year$ER_Fail[i])
+    }
+
+    # Update the data frame in the environment
+    assign(paste0("steal_", year), steal_year)
+  } else {
+    print(paste(re_matrix_name, "not found in RE_matrices. Skipping year."))
+  }
+}
+```
+
+## Summary
+
+```{r}
+for (year in 2011:2022){
+  if(year == 2020){
+   print("Season cancelled due to COVID-19.") 
+  }
+  else{
+    print(paste0("Breakeven steal % for ", year, "."))
+    print(get(paste0("steal_", year)))
+  }
+}
+```
+
+# Export
+## Run Expectancy Matrices by Year
+
+```{r}
+# Create a new Excel workbook
+wb <- createWorkbook()
+
+# Loop through each year in RE_matrices
+for (year in 2011:2022) {
+  # RE_matrix for current year
+  RE_matrix <- RE_matrices[[paste0("RE_matrix_", year)]]
+  
+  # Create a new sheet with the name "RE YYYY"
+  sheetName <- paste("RE", year, sep = " ")
+  addWorksheet(wb, sheetName)
+  
+  # Add an initial column for the runners situation
+  runners_situation <- c("000", "100", "010", "001", "110", "101", "011", "111")
+  writeData(wb, sheet = sheetName, x = cbind(Runners_Situation = runners_situation, RE_matrix))
+}
+
+# Save the workbook to a xlsx file
+saveWorkbook(wb, "C:/Users/richa/OneDrive/Documents/Hyannis Harbor Hawks/Cape Code Data/RE_matrices_by_year.xlsx", overwrite = TRUE)
+saveWorkbook(wb, "C:/Users/richa/OneDrive/Documents/Hyannis Harbor Hawks/Run Expectancy & Steal Model/Output/RE_matrices_by_year.xlsx", overwrite = TRUE)
+```
+
+## Steal Breakeven by Year
+
+```{r}
+# Create a new Excel workbook
+wb_steal <- createWorkbook()
+
+# Loop through each year in steal_YYYY dataframes
+for (year in 2011:2022) {
+  # Check if steal_YYYY dataframe exists
+  if (exists(paste0("steal_", year))) {
+    # Retrieve the steal_YYYY dataframe for the current year
+    current_df <- get(paste0("steal_", year))
+
+    # Create a new sheet with the name "steal YYYY"
+    sheetName <- paste("steal", year, sep = " ")
+    addWorksheet(wb_steal, sheetName)
+
+    # Write the current dataframe to the sheet
+    writeData(wb_steal, sheet = sheetName, x = current_df)
+  }
+}
+
+# Save the workbook to an Excel file
+saveWorkbook(wb_steal, "C:/Users/richa/OneDrive/Documents/Hyannis Harbor Hawks/Cape Code Data/steal_by_year.xlsx", overwrite = TRUE)
+saveWorkbook(wb_steal, "C:/Users/richa/OneDrive/Documents/Hyannis Harbor Hawks/Run Expectancy & Steal Model/Output/steal_by_year.xlsx", overwrite = TRUE)
+```
+

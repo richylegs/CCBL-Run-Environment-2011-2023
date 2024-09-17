@@ -1,0 +1,222 @@
+---
+title: "Cape Cod Run Probability 2023"
+author: "Richard Legler"
+date: "May 22, 2024"
+output: 
+  rmdformats::readthedown:
+    number_sections: true
+    highlight: tango
+    df_print: paged
+    center: true
+---
+
+```{r setup, include=FALSE}
+# Set working directory
+knitr::opts_knit$set(root.dir = 'C:/Users/richa/OneDrive/Documents/Hyannis Harbor Hawks/Cape Code Data')
+
+# Clear environment
+rm(list=ls())
+
+# Import libraries
+library(dplyr)
+library(tidyr)
+library(openxlsx)
+```
+
+# Import Data
+
+```{r}
+# Import
+df <- read.csv("CCBL full_pbp 2023.csv")
+
+# Keep Necessary Columns
+df <- df[,c("GameID","Inning", "Top_Btm", "Outs", "Runner1B", "Runner2B", "Runner3B","InningPACount", "PitchNumPA", "TeamRuns", "RunsScoredOnPlay")]
+```
+
+# Transform Data
+## Remove Rows that add a Pinch Runner
+
+```{r}
+selected_row <- c()
+
+for (i in 1:(nrow(df))) {
+  if (is.na(df$Outs[i])){
+    selected_row <- c(selected_row, i)
+  }
+}
+
+df <- df[-selected_row,]
+```
+
+
+## Add Column with Score After the Pitch
+
+```{r}
+# Add column
+df[,c("TeamRunsAfter")] <- df$TeamRuns + df$RunsScoredOnPlay
+```
+
+## Convert Runners on Base Data
+```{r}
+# First Base
+df$Runner1B <- ifelse(is.na(df$Runner1B),0,1)
+
+# Second Base
+df$Runner2B <- ifelse(is.na(df$Runner2B),0,1)
+
+# Third Base
+df$Runner3B <- ifelse(is.na(df$Runner3B),0,1)
+```
+
+## Make Sure 3 outs in Inning
+
+```{r}
+df <- df %>%
+  arrange(GameID, Top_Btm, Inning, InningPACount, PitchNumPA) %>%
+  mutate(OutsOnPlay = (lead(Outs) - Outs) %% 3) %>%
+  group_by(GameID, Inning, Top_Btm) %>%
+  mutate(OutsInInning = sum(OutsOnPlay)) %>%
+  filter(OutsInInning == 3) %>%
+  ungroup()
+```
+
+# Establish Game States
+Game State format: Outs/Runner on 1B/Runner on 2B/Runner on 3B
+Examples:
+  0 outs and 0 baserunners -> 0000,
+  1 out and runner on 2nd -> 1010,
+  2 outs and bases loaded -> 2111
+
+```{r}
+# Add column for Game States
+df[,c("GameState")] <- paste(df$Outs, df$Runner1B, df$Runner2B, df$Runner3B, sep = "")
+```
+
+## Remove Duplicated Game States in a Plate Appearance
+
+```{r}
+selected_row <- c()
+
+for (i in 1:(nrow(df) - 1)) {
+  if (!is.na(df$GameState[i]) && !is.na(df$GameState[i + 1]) &&
+      df$GameState[i] == df$GameState[i + 1] &&
+      df$InningPACount[i] == df$InningPACount[i + 1]) {
+    selected_row <- c(selected_row, i)
+  }
+}
+
+df_clean <- df[-selected_row,]
+```
+
+
+# Are Runs Scored in the Rest of the Inning?
+## Add Column for Runs Scored Rest of Inning
+
+```{r}
+df_clean[,c("RunsRestInning")] <- NA
+```
+
+## Seperate Data into Half Innings
+
+```{r}
+split_df <- split(df_clean, f=list(df_clean$GameID, df_clean$Inning, df_clean$Top_Btm))
+```
+
+## Function for runs scored in rest of inning
+
+```{r}
+runs_rest_inning <- function(current_score, score_end_inning){
+  if(current_score == score_end_inning){
+    return(FALSE)
+  }
+  else{
+   return(TRUE) 
+  }
+}
+```
+
+## Loop to assign runs scored
+
+```{r}
+# Loop through list of data frames
+for (i in seq_along(split_df)) {
+  split_data <- split_df[[i]]
+  
+  # Check if split_df is not empty
+  if (nrow(split_data) > 0) {
+  
+    # Number of rows in subset
+    n_rows <- nrow(split_data)
+    
+    # Score at end inning of the subset
+    score_end_inning <- tail(split_data$TeamRunsAfter, 1)
+    
+    # Loop through each row in subset
+    for (j in 1:n_rows) {
+      # Retrieve current score
+      current_score <- split_data$TeamRuns[j]
+      
+      # Assign runs of rest inning
+      split_data$RunsRestInning[j] <- runs_rest_inning(current_score, score_end_inning)
+    }
+    
+    # Update original dataframe with modified split_df
+    df_clean[df_clean$GameID %in% split_data$GameID & 
+         df_clean$Inning %in% split_data$Inning &
+         df_clean$Top_Btm %in% split_data$Top_Btm, ] <- split_data
+  }
+}
+```
+
+# Run Probability
+
+```{r}
+game_state_summary <- df_clean %>%
+  group_by(GameState) %>%
+  summarize(
+    count = n(), # Count of occurences
+    more_runs_in_inning = sum(RunsRestInning, na.rm = TRUE), # Count of runs_rest_inning
+    run_probabilty = more_runs_in_inning / count # Expected runs in each game state
+  ) %>%
+  ungroup()
+```
+
+## Run Probability Chart
+
+```{r}
+# Rows and columns
+rows <- c("000", "100", "010", "001", "110", "101", "011", "111")
+columns <- c("0 outs", "1 out", "2 outs")
+
+# Initialize matrix
+RP_matrix <- matrix(NA, nrow = length(rows), ncol = length(columns), dimnames = list(rows, columns))
+
+# Match rows and columns
+match_indices_row <- match(substr(game_state_summary$GameState, 2, 4), rows)
+match_indices_col <- match(substr(game_state_summary$GameState, 1, 1), substr(columns, 1, 1))
+
+# Assign values
+RP_matrix[cbind(match_indices_row, match_indices_col)] <- paste0(round(game_state_summary$run_probabilty * 100, 1), "%")
+print(noquote(RP_matrix))
+```
+
+# Export
+## Run Probability Matrix by Year
+
+```{r}
+# Create a new Excel workbook
+wb <- createWorkbook()
+
+# Create a new sheet with the name "RP 2023"
+sheetName <- "RP 2023"
+addWorksheet(wb, sheetName)
+  
+# Add an initial column for the runners situation
+runners_situation <- c("000", "100", "010", "001", "110", "101", "011", "111")
+writeData(wb, sheet = sheetName, x = cbind(Runners_Situation = runners_situation, RP_matrix))
+
+# Save the workbook to a xlsx file
+saveWorkbook(wb, "C:/Users/richa/OneDrive/Documents/Hyannis Harbor Hawks/Run Probability/Output/RP_matrix_2023.xlsx", overwrite = TRUE)
+saveWorkbook(wb, "C:/Users/richa/OneDrive/Documents/Hyannis Harbor Hawks/Cape Code Data/RP_matrix_2023.xlsx", overwrite = TRUE)
+```
+
